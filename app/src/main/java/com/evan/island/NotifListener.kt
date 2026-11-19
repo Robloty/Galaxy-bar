@@ -16,6 +16,7 @@ data class NotifData(
 object Bus {
     var notif: ((NotifData) -> Unit)? = null
     var connected: (() -> Unit)? = null
+    var cmd: ((String) -> Unit)? = null
 }
 
 class NotifListener : NotificationListenerService() {
