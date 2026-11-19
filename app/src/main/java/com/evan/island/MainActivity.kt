@@ -33,7 +33,10 @@ class MainActivity : Activity() {
                     Uri.parse("package:$packageName"))
             )
         }
-        btn("2. Démarrer l'île") {
+        btn("2. Autoriser l'accès aux notifications") {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
+        btn("3. Démarrer l'île") {
             if (Settings.canDrawOverlays(this)) {
                 startForegroundService(Intent(this, IslandService::class.java))
             }
