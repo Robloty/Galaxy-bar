@@ -1,5 +1,8 @@
 package com.evan.island
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,11 +12,15 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Outline
 import android.graphics.PixelFormat
+import android.graphics.RenderEffect
+import android.graphics.Shader
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraManager
 import android.media.MediaMetadata
@@ -27,38 +34,46 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
 import android.text.TextUtils
-import android.transition.AutoTransition
-import android.transition.TransitionManager
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.view.WindowManager
+import android.view.animation.LinearInterpolator
+import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.core.content.ContextCompat
+import kotlin.math.min
 
 class IslandService : Service() {
     private enum class Mode { IDLE, NOTIF, OPEN, CHARGE }
 
-    private val TOP = 8 // distance du haut en dp : ajuste pour coller à ta caméra
-
+    private lateinit var sp: SharedPreferences
+    private lateinit var cfg: Cfg
     private lateinit var wm: WindowManager
     private lateinit var msm: MediaSessionManager
     private lateinit var cm: CameraManager
     private lateinit var root: FrameLayout
-    private lateinit var island: LinearLayout
+    private lateinit var shell: FrameLayout
+    private lateinit var lp: WindowManager.LayoutParams
     private val h = Handler(Looper.getMainLooper())
 
     private var mode = Mode.IDLE
+    private var lastMode: Mode? = null
+    private var gen = 0
+    private var anim: ValueAnimator? = null
+    private var bg: GlassDrawable? = null
+
     private var notif: NotifData? = null
     private var chargeLevel = 0
     private var ctrl: MediaController? = null
     private var torchId: String? = null
-    private var torchOn = false
+    private var lampOn = false
     private var running = false
     private var acc = 0L
     private var last = 0L
@@ -76,14 +91,13 @@ class IslandService : Service() {
         setColor(c); cornerRadius = r.toFloat()
     }
 
-    private fun gradient(a: Int, b: Int, r: Int) =
-        GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(a, b))
-            .apply { cornerRadius = r.toFloat() }
+    private fun withAlpha(c: Int, pct: Int) =
+        (c and 0x00FFFFFF) or ((pct.coerceIn(0, 100) * 255 / 100) shl 24)
 
     private fun txt(s: String, size: Float, bold: Boolean = false) =
         TextView(this).apply {
             text = s; textSize = size; setTextColor(Color.WHITE)
-            if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
+            if (bold) setTypeface(typeface, Typeface.BOLD)
         }
 
     private fun circleBtn(label: String, color: Int, size: Int = 48, onClick: (TextView) -> Unit) =
@@ -115,9 +129,45 @@ class IslandService : Service() {
         return s.position
     }
 
-    private fun setW(w: Int) {
-        island.layoutParams =
-            FrameLayout.LayoutParams(w, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+    private fun batteryPct(): Int {
+        val b = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val l = b?.getIntExtra(BatteryManager.EXTRA_LEVEL, 0) ?: 0
+        val s = b?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+        return l * 100 / s
+    }
+
+    private fun onTap(f: (() -> Unit)?) {
+        shell.setOnClickListener(f?.let { fn -> View.OnClickListener { fn() } })
+        shell.isClickable = f != null
+    }
+
+    // ---------- préférences ----------
+    private val applyPrefs = Runnable {
+        cfg = Cfg.load(sp)
+        applyWindow()
+        render()
+    }
+
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key != "running") {
+            h.removeCallbacks(applyPrefs)
+            h.postDelayed(applyPrefs, 30)
+        }
+    }
+
+    private fun applyWindow() {
+        lp.x = dp(cfg.posX)
+        lp.y = dp(cfg.posY)
+        if (Build.VERSION.SDK_INT >= 31) {
+            if (cfg.blur > 0 && wm.isCrossWindowBlurEnabled) {
+                lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+                lp.blurBehindRadius = (cfg.blur * 0.6f * resources.displayMetrics.density).toInt()
+            } else {
+                lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
+                lp.blurBehindRadius = 0
+            }
+        }
+        if (root.isAttachedToWindow) wm.updateViewLayout(root, lp)
     }
 
     // ---------- boucle temps réel ----------
@@ -184,7 +234,7 @@ class IslandService : Service() {
     private val torchCb = object : CameraManager.TorchCallback() {
         override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
             torchId = cameraId
-            torchOn = enabled
+            lampOn = enabled
             refreshIfCalm()
         }
     }
@@ -192,11 +242,8 @@ class IslandService : Service() {
     // ---------- charge ----------
     private val rec = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
-            if (i.action == Intent.ACTION_POWER_CONNECTED) {
-                val b = this@IslandService.registerReceiver(
-                    null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-                )
-                chargeLevel = b?.getIntExtra(BatteryManager.EXTRA_LEVEL, 0) ?: 0
+            if (cfg.chargeOn && i.action == Intent.ACTION_POWER_CONNECTED) {
+                chargeLevel = batteryPct()
                 flash(Mode.CHARGE, 2500)
             }
         }
@@ -220,14 +267,21 @@ class IslandService : Service() {
     // ---------- cycle de vie ----------
     override fun onCreate() {
         super.onCreate()
+        sp = Prefs.sp(this)
+        cfg = Cfg.load(sp)
+        sp.edit().putBoolean("running", true).apply()
+        sp.registerOnSharedPreferenceChangeListener(prefListener)
         startAsForeground()
+
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         msm = getSystemService(MediaSessionManager::class.java)
         cm = getSystemService(CameraManager::class.java)
 
-        island = LinearLayout(this)
+        shell = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(0, 0, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+        }
         root = FrameLayout(this).apply {
-            addView(island)
+            addView(shell)
             setOnTouchListener { _, e ->
                 if (e.action == MotionEvent.ACTION_OUTSIDE && mode == Mode.OPEN) {
                     mode = Mode.IDLE; render()
@@ -235,7 +289,7 @@ class IslandService : Service() {
                 false
             }
         }
-        val lp = WindowManager.LayoutParams(
+        lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -244,14 +298,32 @@ class IslandService : Service() {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
             PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = dp(TOP)
-        }
+        ).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL }
+        applyWindow()
         wm.addView(root, lp)
 
-        Bus.notif = { n -> notif = n; flash(Mode.NOTIF, 4500) }
+        Bus.notif = { n ->
+            if (cfg.notifOn) {
+                notif = n
+                flash(Mode.NOTIF, cfg.notifSec * 1000L)
+            }
+        }
         Bus.connected = { hookMedia() }
+        Bus.cmd = { c ->
+            h.post {
+                when (c) {
+                    "open" -> { refreshMedia(); mode = Mode.OPEN; render() }
+                    "notif" -> {
+                        notif = NotifData(
+                            "Island", "Ceci est une notification de test",
+                            applicationInfo.loadIcon(packageManager), null
+                        )
+                        flash(Mode.NOTIF, cfg.notifSec * 1000L)
+                    }
+                    "charge" -> { chargeLevel = batteryPct(); flash(Mode.CHARGE, 2500) }
+                }
+            }
+        }
         cm.registerTorchCallback(torchCb, h)
         ContextCompat.registerReceiver(
             this, rec, IntentFilter(Intent.ACTION_POWER_CONNECTED),
@@ -262,60 +334,183 @@ class IslandService : Service() {
         h.post(tick)
     }
 
-    // ---------- rendu ----------
+    // ---------- rendu + animation ----------
     private fun render() {
-        TransitionManager.beginDelayedTransition(root, AutoTransition().setDuration(220))
-        island.removeAllViews()
-        island.setOnClickListener(null)
-        island.isClickable = false
-        island.minimumWidth = 0
-        island.minimumHeight = 0
-        chronoTv = null; idleChronoTv = null; progress = null; posTv = null
-        when (mode) {
-            Mode.IDLE -> idleView()
-            Mode.NOTIF -> notifView()
-            Mode.CHARGE -> chargeView()
-            Mode.OPEN -> openView()
+        val first = lastMode == null
+        val animate = first || lastMode != mode
+        lastMode = mode
+        gen++
+        val g = gen
+        anim?.cancel()
+        val old = if (shell.childCount > 0) shell.getChildAt(0) else null
+        if (animate && !first && old != null) {
+            old.animate().alpha(0f)
+                .setDuration((110L * 100 / cfg.speed.coerceAtLeast(10)))
+                .withEndAction { if (g == gen) morph(true, false) }
+                .start()
+        } else {
+            old?.animate()?.cancel()
+            morph(animate, first)
         }
     }
 
-    private fun idleView() {
-        setW(-2)
-        island.orientation = LinearLayout.HORIZONTAL
-        island.gravity = Gravity.CENTER_VERTICAL
-        island.minimumWidth = dp(120)
-        island.minimumHeight = dp(34)
-        island.setPadding(dp(12), dp(6), dp(12), dp(6))
-        island.background = rounded(Color.BLACK, dp(20))
-        if (ctrl?.playbackState?.state == PlaybackState.STATE_PLAYING) {
-            island.addView(txt("♪", 15f, true).apply { setTextColor(0xFF1DB954.toInt()) })
+    private fun setShell(w: Int, hh: Int) {
+        val p = shell.layoutParams as FrameLayout.LayoutParams
+        p.width = w; p.height = hh
+        shell.layoutParams = p
+    }
+
+    private fun morph(animate: Boolean, first: Boolean) {
+        val c = buildContent()
+        val m = mode
+        val open = m == Mode.OPEN
+        val fixed = open || m == Mode.NOTIF
+        c.measure(
+            View.MeasureSpec.makeMeasureSpec(
+                dp(cfg.openW),
+                if (fixed) View.MeasureSpec.EXACTLY else View.MeasureSpec.AT_MOST
+            ),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        val tw = c.measuredWidth
+        val th = c.measuredHeight
+        val raw = if (fixed) dp(cfg.radius).toFloat() else th / 2f
+        val toR = min(raw, th / 2f)
+
+        val tint = TINTS[cfg.tint.coerceIn(0, TINTS.lastIndex)]
+        val top = if (open) tint.top else 0xFF14141A.toInt()
+        val bottom = if (open) tint.bottom else 0xFF000000.toInt()
+        val pct = when {
+            !cfg.glass -> 100
+            open -> cfg.opacity
+            else -> (cfg.opacity + 20).coerceAtMost(100)
         }
-        if (torchOn) {
-            island.addView(txt("🔦", 13f).apply { setPadding(dp(8), 0, 0, 0) })
+        val newBg = GlassDrawable(
+            withAlpha(top, pct), withAlpha(bottom, pct),
+            cfg.glass, cfg.border, resources.displayMetrics.density
+        )
+
+        val cur = shell.layoutParams
+        val fromW = if (first || cur.width <= 0) (tw * 0.5f).toInt() else cur.width
+        val fromH = if (first || cur.height <= 0) (th * 0.6f).toInt() else cur.height
+        val fromR = if (first) toR else (bg?.radius ?: toR)
+
+        bg = newBg
+        shell.background = newBg
+        shell.removeAllViews()
+        shell.addView(c, FrameLayout.LayoutParams(tw, th))
+
+        if (!animate) {
+            setShell(tw, th)
+            newBg.radius = toR
+            return
         }
-        if (running || acc > 0) {
+
+        newBg.radius = fromR
+        setShell(fromW, fromH)
+        val dur = 440L * 100 / cfg.speed.coerceAtLeast(10)
+        val ip = OvershootInterpolator(cfg.bounce / 100f * 3f)
+        val d = resources.displayMetrics.density
+        c.alpha = if (open) 1f else 0f
+        if (open && c is ViewGroup) {
+            for (i in 0 until c.childCount) c.getChildAt(i).alpha = 0f
+        }
+
+        val va = ValueAnimator.ofFloat(0f, 1f)
+        va.duration = dur
+        va.interpolator = LinearInterpolator()
+        va.addUpdateListener { a ->
+            val f = a.animatedValue as Float
+            val e = ip.getInterpolation(f)
+            setShell(
+                (fromW + (tw - fromW) * e).toInt().coerceAtLeast(1),
+                (fromH + (th - fromH) * e).toInt().coerceAtLeast(1)
+            )
+            newBg.radius = fromR + (toR - fromR) * f
+            val p = ((f - 0.25f) / 0.55f).coerceIn(0f, 1f)
+            if (open && c is ViewGroup) {
+                for (i in 0 until c.childCount) {
+                    val pi = ((f - 0.22f - 0.07f * i) / 0.5f).coerceIn(0f, 1f)
+                    val ch = c.getChildAt(i)
+                    ch.alpha = pi
+                    ch.translationY = (1f - pi) * -(10f * d)
+                }
+            } else {
+                c.alpha = p
+            }
+            if (Build.VERSION.SDK_INT >= 31 && cfg.focusBlur) {
+                val b = (1f - p) * 9f * d
+                c.setRenderEffect(
+                    if (b > 0.5f) RenderEffect.createBlurEffect(b, b, Shader.TileMode.CLAMP) else null
+                )
+            }
+        }
+        va.addListener(object : AnimatorListenerAdapter() {
+            override fun onAnimationEnd(an: Animator) {
+                c.alpha = 1f
+                if (c is ViewGroup) {
+                    for (i in 0 until c.childCount) {
+                        c.getChildAt(i).alpha = 1f
+                        c.getChildAt(i).translationY = 0f
+                    }
+                }
+                if (Build.VERSION.SDK_INT >= 31) c.setRenderEffect(null)
+            }
+        })
+        anim = va
+        va.start()
+    }
+
+    // ---------- contenus ----------
+    private fun buildContent(): View {
+        chronoTv = null; idleChronoTv = null; progress = null; posTv = null
+        onTap(null)
+        return when (mode) {
+            Mode.IDLE -> idleContent()
+            Mode.NOTIF -> notifContent()
+            Mode.CHARGE -> chargeContent()
+            Mode.OPEN -> openContent()
+        }
+    }
+
+    private fun idleContent(): View {
+        val v = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            minimumWidth = dp(cfg.idleW)
+            minimumHeight = dp(cfg.idleH)
+            setPadding(dp(14), dp(4), dp(14), dp(4))
+        }
+        if (cfg.musicOn && ctrl?.playbackState?.state == PlaybackState.STATE_PLAYING) {
+            v.addView(txt("♪", 15f, true).apply { setTextColor(0xFF1DB954.toInt()) })
+        }
+        if (cfg.torchOn && lampOn) {
+            v.addView(txt("🔦", 13f).apply { setPadding(dp(8), 0, 0, 0) })
+        }
+        if (cfg.chronoOn && (running || acc > 0)) {
             idleChronoTv = txt(fmt(chronoMs()), 12f, true).apply { setPadding(dp(8), 0, 0, 0) }
-            island.addView(idleChronoTv)
+            v.addView(idleChronoTv)
         }
-        island.setOnClickListener {
+        onTap {
             refreshMedia()
             mode = Mode.OPEN
             render()
         }
+        return v
     }
 
-    private fun notifView() {
-        val n = notif ?: run { mode = Mode.IDLE; return idleView() }
-        setW(dp(340))
-        island.orientation = LinearLayout.HORIZONTAL
-        island.gravity = Gravity.CENTER_VERTICAL
-        island.setPadding(dp(14), dp(10), dp(16), dp(10))
-        island.background = rounded(Color.BLACK, dp(32))
-        island.addView(ImageView(this).apply {
+    private fun notifContent(): View {
+        val n = notif ?: run { mode = Mode.IDLE; return idleContent() }
+        val v = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(10), dp(16), dp(10))
+        }
+        v.addView(ImageView(this).apply {
             setImageDrawable(n.icon)
             layoutParams = LinearLayout.LayoutParams(dp(38), dp(38))
         })
-        island.addView(LinearLayout(this).apply {
+        v.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(12) }
             addView(txt(n.title, 14f, true).apply {
@@ -325,42 +520,51 @@ class IslandService : Service() {
                 alpha = .75f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END
             })
         })
-        island.setOnClickListener {
+        onTap {
             try { n.intent?.send() } catch (e: Exception) { }
             mode = Mode.IDLE
             render()
         }
+        return v
     }
 
-    private fun chargeView() {
-        setW(-2)
-        island.orientation = LinearLayout.HORIZONTAL
-        island.gravity = Gravity.CENTER
-        island.minimumWidth = dp(160)
-        island.setPadding(dp(18), dp(9), dp(18), dp(9))
-        island.background = rounded(Color.BLACK, dp(24))
-        island.addView(txt("⚡", 16f).apply { setTextColor(0xFF4ADE80.toInt()) })
-        island.addView(txt("$chargeLevel%", 15f, true).apply { setPadding(dp(8), 0, 0, 0) })
+    private fun chargeContent(): View {
+        val v = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            minimumWidth = dp(150)
+            setPadding(dp(18), dp(9), dp(18), dp(9))
+        }
+        v.addView(txt("⚡", 16f).apply { setTextColor(0xFF4ADE80.toInt()) })
+        v.addView(txt("$chargeLevel%", 15f, true).apply { setPadding(dp(8), 0, 0, 0) })
+        return v
     }
 
-    private fun openView() {
-        setW(dp(344))
-        island.orientation = LinearLayout.VERTICAL
-        island.gravity = Gravity.CENTER_HORIZONTAL
-        island.setPadding(dp(8), dp(10), dp(8), dp(10))
-        island.background = rounded(Color.BLACK, dp(36))
-        island.addView(View(this).apply {
+    private fun openContent(): View {
+        val v = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(8), dp(10), dp(8), dp(12))
+        }
+        v.addView(View(this).apply {
             background = rounded(0x55FFFFFF, dp(3))
             layoutParams = LinearLayout.LayoutParams(dp(40), dp(4))
-            setOnClickListener { mode = Mode.IDLE; render() }
         })
-        ctrl?.let { island.addView(mediaCard(it)) }
-        if (torchOn) island.addView(torchCard())
-        island.addView(chronoCard())
+        if (cfg.musicOn) ctrl?.let { v.addView(mediaCard(it)) }
+        if (cfg.torchOn && lampOn) v.addView(torchCard())
+        if (cfg.chronoOn) v.addView(chronoCard())
+        if (v.childCount == 1) {
+            v.addView(txt("Rien en cours", 13f).apply {
+                alpha = .6f; setPadding(0, dp(14), 0, dp(6))
+            })
+        }
+        onTap { mode = Mode.IDLE; render() }
+        return v
     }
 
-    private fun card(c1: Int, c2: Int, r: Int = 28) = LinearLayout(this).apply {
-        background = gradient(c1, c2, dp(r))
+    private fun card(c1: Int, c2: Int, r: Int = 26) = LinearLayout(this).apply {
+        background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(c1, c2))
+            .apply { cornerRadius = dp(r).toFloat() }
         setPadding(dp(16), dp(12), dp(16), dp(12))
         layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
     }
@@ -373,11 +577,11 @@ class IslandService : Service() {
             ?: md?.getBitmap(MediaMetadata.METADATA_KEY_ART)
         val playing = c.playbackState?.state == PlaybackState.STATE_PLAYING
 
-        val card = card(0xFF1A0B5C.toInt(), 0xFF9B2E7A.toInt())
+        val card = card(0x12FFFFFF, 0x66E8507F)
         card.orientation = LinearLayout.VERTICAL
 
-        val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        top.addView(ImageView(this).apply {
+        val topRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        topRow.addView(ImageView(this).apply {
             setImageBitmap(art)
             scaleType = ImageView.ScaleType.CENTER_CROP
             setBackgroundColor(0x33FFFFFF)
@@ -389,7 +593,7 @@ class IslandService : Service() {
             }
             layoutParams = LinearLayout.LayoutParams(dp(56), dp(56))
         })
-        top.addView(LinearLayout(this).apply {
+        topRow.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(12) }
             addView(txt(title, 15f, true).apply {
@@ -399,7 +603,7 @@ class IslandService : Service() {
                 alpha = .75f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END
             })
         })
-        card.addView(top)
+        card.addView(topRow)
 
         val pb = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 1000
@@ -416,18 +620,17 @@ class IslandService : Service() {
             gravity = Gravity.CENTER
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) }
         }
-        val soft = 0x22FFFFFF
-        row.addView(circleBtn("⏮", soft, 44) { c.transportControls.skipToPrevious() })
+        row.addView(circleBtn("⏮", 0x22FFFFFF, 44) { c.transportControls.skipToPrevious() })
         row.addView(circleBtn(if (playing) "⏸" else "▶", 0x44FFFFFF, 52) {
             if (playing) c.transportControls.pause() else c.transportControls.play()
         })
-        row.addView(circleBtn("⏭", soft, 44) { c.transportControls.skipToNext() })
+        row.addView(circleBtn("⏭", 0x22FFFFFF, 44) { c.transportControls.skipToNext() })
         card.addView(row)
         return card
     }
 
     private fun torchCard(): View {
-        val card = card(0xFF2B2B2B.toInt(), 0xFF4A4A4A.toInt(), 26)
+        val card = card(0x22FFFFFF, 0x0DFFFFFF)
         card.gravity = Gravity.CENTER_VERTICAL
         card.addView(txt("🔦", 22f))
         card.addView(txt("Lampe torche", 15f, true).apply {
@@ -440,7 +643,7 @@ class IslandService : Service() {
     }
 
     private fun chronoCard(): View {
-        val card = card(0xFF1A0B5C.toInt(), 0xFF3A0CA3.toInt())
+        val card = card(0x22FFFFFF, 0x0DFFFFFF)
         card.gravity = Gravity.CENTER_VERTICAL
         card.addView(txt("⏱", 22f))
         chronoTv = txt(fmt(chronoMs()), 26f, true)
@@ -482,8 +685,12 @@ class IslandService : Service() {
 
     override fun onDestroy() {
         h.removeCallbacksAndMessages(null)
+        anim?.cancel()
+        sp.unregisterOnSharedPreferenceChangeListener(prefListener)
+        sp.edit().putBoolean("running", false).apply()
         Bus.notif = null
         Bus.connected = null
+        Bus.cmd = null
         try { cm.unregisterTorchCallback(torchCb) } catch (e: Exception) { }
         try { unregisterReceiver(rec) } catch (e: Exception) { }
         try { msm.removeOnActiveSessionsChangedListener(sessionsListener) } catch (e: Exception) { }
