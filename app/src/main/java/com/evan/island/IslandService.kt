@@ -2,6 +2,7 @@ package com.evan.island
 
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
+import android.animation.ArgbEvaluator
 import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.NotificationChannel
@@ -34,13 +35,14 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
 import android.text.TextUtils
+import android.view.GestureDetector
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.view.WindowManager
-import android.view.animation.LinearInterpolator
+import android.view.animation.DecelerateInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -48,6 +50,11 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.core.content.ContextCompat
+import androidx.dynamicanimation.animation.DynamicAnimation
+import androidx.dynamicanimation.animation.FloatValueHolder
+import androidx.dynamicanimation.animation.SpringAnimation
+import androidx.dynamicanimation.animation.SpringForce
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -62,14 +69,25 @@ class IslandService : Service() {
     private lateinit var root: FrameLayout
     private lateinit var shell: FrameLayout
     private lateinit var lp: WindowManager.LayoutParams
+    private lateinit var bg: GlassDrawable
     private val h = Handler(Looper.getMainLooper())
 
     private var mode = Mode.IDLE
     private var lastMode: Mode? = null
-    private var gen = 0
-    private var anim: ValueAnimator? = null
-    private var bg: GlassDrawable? = null
     private var fx: Array<RenderEffect?>? = null
+
+    // ressorts
+    private val holderW = FloatValueHolder(0f)
+    private val holderH = FloatValueHolder(0f)
+    private lateinit var springW: SpringAnimation
+    private lateinit var springH: SpringAnimation
+    private var curW = 0f
+    private var curH = 0f
+    private var tgtW = 1
+    private var tgtH = 1
+    private var bigR = 1000f
+    private var colorAnim: ValueAnimator? = null
+    private var enterAnim: ValueAnimator? = null
 
     private var notif: NotifData? = null
     private var chargeLevel = 0
@@ -118,6 +136,14 @@ class IslandService : Service() {
             }
             setOnClickListener { onClick(this) }
         }
+
+    private fun measureW(v: View): Int {
+        v.measure(
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        return v.measuredWidth
+    }
 
     private fun fmt(ms: Long): String {
         val s = ms / 1000
@@ -200,15 +226,6 @@ class IslandService : Service() {
     private fun applyWindow() {
         lp.x = dp(cfg.posX)
         lp.y = dp(cfg.posY)
-        if (Build.VERSION.SDK_INT >= 31) {
-            if (cfg.blur > 0 && wm.isCrossWindowBlurEnabled) {
-                lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
-                lp.blurBehindRadius = (cfg.blur * 0.6f * resources.displayMetrics.density).toInt()
-            } else {
-                lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
-                lp.blurBehindRadius = 0
-            }
-        }
         if (root.isAttachedToWindow) wm.updateViewLayout(root, lp)
     }
 
@@ -219,11 +236,63 @@ class IslandService : Service() {
         if (root.isAttachedToWindow) wm.updateViewLayout(root, lp)
     }
 
+    private fun reserveWindow() {
+        val m = if (cfg.bounce > 0) dp(16) else 0
+        setWindow(max(curW.toInt(), tgtW) + m, max(curH.toInt(), tgtH) + m)
+    }
+
+    private fun settle() {
+        if (!springW.isRunning && !springH.isRunning) setWindow(tgtW, tgtH)
+    }
+
+    // ---------- ressorts ----------
+    private fun makeSprings() {
+        springW = SpringAnimation(holderW).setSpring(SpringForce(0f))
+        springH = SpringAnimation(holderH).setSpring(SpringForce(0f))
+        springW.addUpdateListener { _, v, _ -> curW = v; applyShell() }
+        springH.addUpdateListener { _, v, _ -> curH = v; applyShell() }
+        val end = DynamicAnimation.OnAnimationEndListener { _, canceled, _, _ ->
+            if (!canceled) settle()
+        }
+        springW.addEndListener(end)
+        springH.addEndListener(end)
+    }
+
+    private fun configureSprings(expanding: Boolean) {
+        val s = cfg.speed / 100f
+        val k = (380f * s * s).coerceIn(120f, 2400f)
+        val z = (1f - cfg.bounce / 100f * (if (expanding) 0.5f else 0.3f)).coerceIn(0.45f, 1f)
+        springW.spring.setStiffness(k).setDampingRatio(z)
+        springH.spring.setStiffness(k * 0.9f).setDampingRatio(z)
+    }
+
+    private fun applyShell() {
+        val p = shell.layoutParams as FrameLayout.LayoutParams
+        val w = curW.toInt().coerceAtLeast(1)
+        val hh = curH.toInt().coerceAtLeast(1)
+        if (p.width != w || p.height != hh) {
+            p.width = w
+            p.height = hh
+            shell.layoutParams = p
+        }
+        bg.radius = min(bigR, hh / 2f)
+    }
+
+    private fun snap(w: Float, hh: Float) {
+        springW.cancel()
+        springH.cancel()
+        holderW.value = w
+        holderH.value = hh
+        curW = w
+        curH = hh
+        applyShell()
+    }
+
     // ---------- boucle temps réel ----------
     private val tick = object : Runnable {
         override fun run() {
             chronoTv?.text = fmt(chronoMs())
-            idleChronoTv?.text = "⏱ " + (timerLabel() ?: "")
+            idleChronoTv?.text = timerLabel() ?: ""
             for ((k, tv) in timerViews) timers[k]?.let { tv.text = timerText(it) }
             val d = ctrl?.metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
             val pb = progress
@@ -293,7 +362,7 @@ class IslandService : Service() {
         override fun onReceive(c: Context, i: Intent) {
             if (cfg.chargeOn && i.action == Intent.ACTION_POWER_CONNECTED) {
                 chargeLevel = batteryPct()
-                flash(Mode.CHARGE, 2500)
+                flash(Mode.CHARGE, 3000)
             }
         }
     }
@@ -313,6 +382,25 @@ class IslandService : Service() {
         h.postDelayed(back, ms)
     }
 
+    private fun close() {
+        h.removeCallbacks(back)
+        mode = Mode.IDLE
+        render()
+    }
+
+    // ---------- gestes ----------
+    private val gd by lazy {
+        GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                if ((mode == Mode.OPEN || mode == Mode.NOTIF) && vy < -700f && abs(vy) > abs(vx)) {
+                    close()
+                    return true
+                }
+                return false
+            }
+        })
+    }
+
     // ---------- cycle de vie ----------
     override fun onCreate() {
         super.onCreate()
@@ -326,15 +414,36 @@ class IslandService : Service() {
         msm = getSystemService(MediaSessionManager::class.java)
         cm = getSystemService(CameraManager::class.java)
 
+        bg = GlassDrawable(0xFF000000.toInt(), 0xFF000000.toInt(), false, false,
+            resources.displayMetrics.density)
         shell = FrameLayout(this).apply {
-            layoutParams = FrameLayout.LayoutParams(0, 0, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+            layoutParams = FrameLayout.LayoutParams(1, 1, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+            background = bg
+            clipToOutline = true
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(v: View, o: Outline) {
+                    o.setRoundRect(0, 0, v.width, v.height, min(bigR, v.height / 2f))
+                }
+            }
+            setOnTouchListener { v, e ->
+                gd.onTouchEvent(e)
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> if (v.isClickable) {
+                        v.pivotX = v.width / 2f
+                        v.pivotY = 0f
+                        v.animate().scaleX(0.97f).scaleY(0.97f).setDuration(110).start()
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                        v.animate().scaleX(1f).scaleY(1f).setDuration(220)
+                            .setInterpolator(OvershootInterpolator(2f)).start()
+                }
+                false
+            }
         }
         root = FrameLayout(this).apply {
             addView(shell)
             setOnTouchListener { _, e ->
-                if (e.action == MotionEvent.ACTION_OUTSIDE && mode == Mode.OPEN) {
-                    mode = Mode.IDLE; render()
-                }
+                if (e.action == MotionEvent.ACTION_OUTSIDE && mode == Mode.OPEN) close()
                 false
             }
         }
@@ -360,6 +469,7 @@ class IslandService : Service() {
         }
         applyWindow()
         wm.addView(root, lp)
+        makeSprings()
 
         Bus.notif = { n ->
             if (cfg.notifOn) {
@@ -373,7 +483,7 @@ class IslandService : Service() {
                 timers[t.key] = t
                 if (isNew && cfg.chronoOn && mode != Mode.OPEN) {
                     notif = NotifData(
-                        t.title.ifBlank { "Minuteur" }, timerText(t), t.icon, t.intent
+                        t.title.ifBlank { "Minuteur" }, "En cours", t.icon, t.intent, timerText(t)
                     )
                     flash(Mode.NOTIF, cfg.notifSec * 1000L)
                 } else {
@@ -406,7 +516,7 @@ class IslandService : Service() {
                         )
                         flash(Mode.NOTIF, cfg.notifSec * 1000L)
                     }
-                    "charge" -> { chargeLevel = batteryPct(); flash(Mode.CHARGE, 2500) }
+                    "charge" -> { chargeLevel = batteryPct(); flash(Mode.CHARGE, 3000) }
                     "chrono" -> {
                         if (running || acc > 0) {
                             running = false; acc = 0
@@ -429,39 +539,58 @@ class IslandService : Service() {
         h.post(tick)
     }
 
-    // ---------- rendu + animation ----------
-    private fun render() {
-        val first = lastMode == null
-        val animate = first || lastMode != mode
-        lastMode = mode
-        gen++
-        val g = gen
-        anim?.cancel()
-        val old = if (shell.childCount > 0) shell.getChildAt(0) else null
-        if (animate && !first && old != null) {
-            old.animate().alpha(0f)
-                .setDuration(110L * 100 / cfg.speed.coerceAtLeast(10))
-                .withEndAction { if (g == gen) morph(true, false) }
-                .start()
-        } else {
-            old?.animate()?.cancel()
-            morph(animate, first)
+    // ---------- rendu ----------
+    private fun applyStyle(m: Mode, animate: Boolean) {
+        val tint = TINTS[cfg.tint.coerceIn(0, TINTS.lastIndex)]
+        val solid = cfg.style == 0 || m == Mode.IDLE || m == Mode.CHARGE
+        var top = 0xFF000000.toInt()
+        var bottom = 0xFF000000.toInt()
+        var sheen = false
+        var border = false
+        if (!solid) {
+            if (m == Mode.OPEN) {
+                top = tint.top; bottom = tint.bottom
+            } else {
+                top = 0xFF26262E.toInt(); bottom = 0xFF050507.toInt()
+            }
+            sheen = true
+            border = cfg.border
+            if (cfg.style == 2) {
+                top = withAlpha(top, cfg.opacity)
+                bottom = withAlpha(bottom, cfg.opacity)
+            }
+        }
+        bg.sheen = sheen
+        bg.border = border
+        colorAnim?.cancel()
+        if (!animate) {
+            bg.setColors(top, bottom)
+            return
+        }
+        val t1 = top
+        val b1 = bottom
+        val t0 = bg.top
+        val b0 = bg.bottom
+        val ev = ArgbEvaluator()
+        colorAnim = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 280
+            addUpdateListener { a ->
+                val f = a.animatedFraction
+                bg.setColors(ev.evaluate(f, t0, t1) as Int, ev.evaluate(f, b0, b1) as Int)
+            }
+            start()
         }
     }
 
-    private fun setShell(w: Int, hh: Int) {
-        val p = shell.layoutParams as FrameLayout.LayoutParams
-        p.width = w
-        p.height = hh
-        shell.layoutParams = p
-    }
+    private fun render() {
+        val first = lastMode == null
+        val changed = first || lastMode != mode
+        lastMode = mode
 
-    private fun morph(animate: Boolean, first: Boolean) {
         val c = buildContent()
         val m = mode
         val open = m == Mode.OPEN
         val fixed = open || m == Mode.NOTIF
-        val solid = m == Mode.IDLE || m == Mode.CHARGE
         c.measure(
             View.MeasureSpec.makeMeasureSpec(
                 dp(cfg.openW),
@@ -471,83 +600,76 @@ class IslandService : Service() {
         )
         val tw = c.measuredWidth
         val th = c.measuredHeight
-        val raw = if (fixed) dp(cfg.radius).toFloat() else th / 2f
-        val toR = min(raw, th / 2f)
 
-        val tint = TINTS[cfg.tint.coerceIn(0, TINTS.lastIndex)]
-        val top = when {
-            open -> tint.top
-            solid -> 0xFF000000.toInt()
-            else -> 0xFF1A1A22.toInt()
+        bigR = if (fixed) dp(cfg.radius).toFloat() else 1000f
+        shell.invalidateOutline()
+        applyStyle(m, !first && changed)
+
+        enterAnim?.cancel()
+        val olds = ArrayList<View>()
+        for (i in 0 until shell.childCount) olds.add(shell.getChildAt(i))
+        if (changed && !first) {
+            for (o in olds) {
+                o.animate().cancel()
+                o.animate().alpha(0f).scaleX(0.94f).scaleY(0.94f).setDuration(120)
+                    .withEndAction { shell.removeView(o) }.start()
+            }
+        } else {
+            for (o in olds) {
+                o.animate().cancel()
+                shell.removeView(o)
+            }
         }
-        val bottom = if (open) tint.bottom else 0xFF000000.toInt()
-        val pct = when {
-            solid || !cfg.glass -> 100
-            open -> cfg.opacity
-            else -> (cfg.opacity + 10).coerceAtMost(100)
-        }
-        val newBg = GlassDrawable(
-            withAlpha(top, pct), withAlpha(bottom, pct),
-            cfg.glass && !solid, cfg.border && !solid,
-            resources.displayMetrics.density
-        )
-
-        val cur = shell.layoutParams
-        val fromW = if (first || cur.width <= 0) (tw * 0.5f).toInt() else cur.width
-        val fromH = if (first || cur.height <= 0) (th * 0.6f).toInt() else cur.height
-        val fromR = if (first) toR else (bg?.radius ?: toR)
-
-        bg = newBg
-        shell.background = newBg
-        shell.removeAllViews()
         shell.addView(c, FrameLayout.LayoutParams(tw, th, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
 
-        if (!animate) {
-            setShell(tw, th)
-            newBg.radius = toR
-            setWindow(tw, th)
-            return
+        if (first) snap(tw * 0.55f, th * 0.6f)
+        tgtW = tw
+        tgtH = th
+        configureSprings(tw.toLong() * th > (curW * curH).toLong())
+        reserveWindow()
+        springW.animateToFinalPosition(tw.toFloat())
+        springH.animateToFinalPosition(th.toFloat())
+
+        if (changed) enter(c, open, tw)
+    }
+
+    private fun enter(c: View, open: Boolean, tw: Int) {
+        val stagger = open && c is ViewGroup
+        c.pivotX = tw / 2f
+        c.pivotY = 0f
+        if (stagger) {
+            val g = c as ViewGroup
+            for (i in 0 until g.childCount) g.getChildAt(i).alpha = 0f
+        } else {
+            c.alpha = 0f
+            c.scaleX = 0.92f
+            c.scaleY = 0.92f
         }
-
-        val margin = if (cfg.bounce > 0) dp(14) else 0
-        setWindow(max(fromW, tw) + margin, max(fromH, th) + margin)
-        newBg.radius = fromR
-        setShell(fromW, fromH)
-
-        val dur = 440L * 100 / cfg.speed.coerceAtLeast(10)
-        val ip = OvershootInterpolator(cfg.bounce / 100f * 3f)
         val d = resources.displayMetrics.density
-        c.alpha = if (open) 1f else 0f
-        if (open && c is ViewGroup) {
-            for (i in 0 until c.childCount) c.getChildAt(i).alpha = 0f
-        }
-
         var lastLvl = -1
         var cancelled = false
         val va = ValueAnimator.ofFloat(0f, 1f)
-        va.duration = dur
-        va.interpolator = LinearInterpolator()
+        va.duration = 340L * 100 / cfg.speed.coerceAtLeast(10)
+        va.startDelay = 50
+        va.interpolator = DecelerateInterpolator(1.3f)
         va.addUpdateListener { a ->
             val f = a.animatedValue as Float
-            val e = ip.getInterpolation(f)
-            setShell(
-                (fromW + (tw - fromW) * e).toInt().coerceAtLeast(1),
-                (fromH + (th - fromH) * e).toInt().coerceAtLeast(1)
-            )
-            newBg.radius = fromR + (toR - fromR) * f
-            val p = ((f - 0.25f) / 0.55f).coerceIn(0f, 1f)
-            if (open && c is ViewGroup) {
-                for (i in 0 until c.childCount) {
-                    val pi = ((f - 0.22f - 0.07f * i) / 0.5f).coerceIn(0f, 1f)
-                    val ch = c.getChildAt(i)
+            if (stagger) {
+                val g = c as ViewGroup
+                for (i in 0 until g.childCount) {
+                    val pi = ((f - 0.1f * i) / 0.65f).coerceIn(0f, 1f)
+                    val ch = g.getChildAt(i)
                     ch.alpha = pi
                     ch.translationY = (1f - pi) * -(10f * d)
                 }
             } else {
-                c.alpha = p
+                c.alpha = f
+                val s = 0.92f + 0.08f * f
+                c.scaleX = s
+                c.scaleY = s
             }
             if (Build.VERSION.SDK_INT >= 31 && cfg.focusBlur) {
-                val lvl = Math.ceil(((1f - p) * 4f).toDouble()).toInt().coerceIn(0, 4)
+                val lvl = Math.ceil(((1f - f) * 3f).toDouble()).toInt().coerceIn(0, 3)
                 if (lvl != lastLvl) {
                     lastLvl = lvl
                     c.setRenderEffect(fxLevel(lvl))
@@ -560,18 +682,20 @@ class IslandService : Service() {
             }
 
             override fun onAnimationEnd(an: Animator) {
+                if (Build.VERSION.SDK_INT >= 31) c.setRenderEffect(null)
+                if (cancelled) return
                 c.alpha = 1f
+                c.scaleX = 1f
+                c.scaleY = 1f
                 if (c is ViewGroup) {
                     for (i in 0 until c.childCount) {
                         c.getChildAt(i).alpha = 1f
                         c.getChildAt(i).translationY = 0f
                     }
                 }
-                if (Build.VERSION.SDK_INT >= 31) c.setRenderEffect(null)
-                if (!cancelled) setWindow(tw, th)
             }
         })
-        anim = va
+        enterAnim = va
         va.start()
     }
 
@@ -588,97 +712,139 @@ class IslandService : Service() {
         }
     }
 
-    private fun idleContent(): View {
-        val v = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            minimumWidth = dp(cfg.idleW)
-            minimumHeight = dp(cfg.idleH)
-            setPadding(dp(14), dp(4), dp(14), dp(4))
-        }
-        if (cfg.musicOn && ctrl?.playbackState?.state == PlaybackState.STATE_PLAYING) {
-            v.addView(txt("♪", 15f, true).apply { setTextColor(0xFF1DB954.toInt()) })
-        }
-        if (cfg.torchOn && lampOn) {
-            v.addView(txt("🔦", 13f).apply { setPadding(dp(8), 0, 0, 0) })
-        }
-        if (cfg.chronoOn) {
-            timerLabel()?.let {
-                idleChronoTv = txt("⏱ $it", 12f, true).apply { setPadding(dp(8), 0, 0, 0) }
-                v.addView(idleChronoTv)
+    /** Ligne avec un trou au milieu (caméra) : une vue à gauche, une à droite. */
+    private fun splitRow(l: View?, r: View?, minSide: Int): LinearLayout {
+        val lw = l?.let { measureW(it) } ?: 0
+        val rw = r?.let { measureW(it) } ?: 0
+        val side = max(max(lw, rw) + dp(14), minSide)
+        val rowH = dp(cfg.idleH)
+        val left = FrameLayout(this).apply {
+            l?.let {
+                addView(it, FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL)
+                    .apply { marginEnd = dp(8) })
             }
         }
+        val right = FrameLayout(this).apply {
+            r?.let {
+                addView(it, FrameLayout.LayoutParams(-2, -2, Gravity.START or Gravity.CENTER_VERTICAL)
+                    .apply { marginStart = dp(8) })
+            }
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            minimumHeight = rowH
+            addView(left, LinearLayout.LayoutParams(side, rowH))
+            addView(View(context), LinearLayout.LayoutParams(dp(cfg.holeW), rowH))
+            addView(right, LinearLayout.LayoutParams(side, rowH))
+        }
+    }
+
+    private fun idleContent(): View {
         onTap {
             refreshMedia()
             mode = Mode.OPEN
             render()
         }
-        return v
+        val icons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        var rightView: View? = null
+        val timerStr = if (cfg.chronoOn) timerLabel() else null
+        val playing = cfg.musicOn && ctrl?.playbackState?.state == PlaybackState.STATE_PLAYING
+        if (playing) {
+            icons.addView(txt("♪", 15f, true).apply { setTextColor(0xFF1DB954.toInt()) })
+        }
+        if (cfg.torchOn && lampOn) {
+            icons.addView(txt("🔦", 13f).apply { setPadding(dp(6), 0, 0, 0) })
+        }
+        if (timerStr != null) {
+            icons.addView(txt("⏱", 14f).apply { setPadding(dp(6), 0, 0, 0) })
+            idleChronoTv = txt(timerStr, 13f, true).apply {
+                setTextColor(0xFFFF9F0A.toInt())
+                fontFeatureSettings = "tnum"
+            }
+            rightView = idleChronoTv
+        } else if (playing) {
+            rightView = txt("▂▅▃", 11f, true).apply { setTextColor(0xFF1DB954.toInt()) }
+        }
+        if (icons.childCount == 0) {
+            return LinearLayout(this).apply {
+                minimumWidth = dp(cfg.idleW)
+                minimumHeight = dp(cfg.idleH)
+            }
+        }
+        val minSide = ((dp(cfg.idleW) - dp(cfg.holeW)) / 2).coerceAtLeast(dp(20))
+        return splitRow(icons, rightView, minSide)
+    }
+
+    private fun chargeContent(): View {
+        val green = 0xFF30D158.toInt()
+        val l = txt("⚡", 17f).apply { setTextColor(green) }
+        val r = txt("$chargeLevel%", 15f, true).apply {
+            setTextColor(green)
+            fontFeatureSettings = "tnum"
+        }
+        return splitRow(l, r, dp(52))
     }
 
     private fun notifContent(): View {
         val n = notif ?: run { mode = Mode.IDLE; return idleContent() }
-        val v = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14), dp(10), dp(16), dp(10))
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val head = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(-1, dp(cfg.idleH))
         }
-        v.addView(ImageView(this).apply {
-            setImageDrawable(n.icon)
-            layoutParams = LinearLayout.LayoutParams(dp(38), dp(38))
+        head.addView(ImageView(this).apply { setImageDrawable(n.icon) },
+            FrameLayout.LayoutParams(dp(24), dp(24), Gravity.START or Gravity.CENTER_VERTICAL)
+                .apply { marginStart = dp(18) })
+        head.addView(
+            txt(n.badge ?: "maintenant", 12f, n.badge != null).apply {
+                alpha = .8f
+                fontFeatureSettings = "tnum"
+            },
+            FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL)
+                .apply { marginEnd = dp(18) }
+        )
+        col.addView(head)
+        col.addView(txt(n.title, 15f, true).apply {
+            setPadding(dp(18), 0, dp(18), if (n.text.isBlank()) dp(14) else 0)
+            maxLines = 1; ellipsize = TextUtils.TruncateAt.END
         })
-        v.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(12) }
-            addView(txt(n.title, 14f, true).apply {
-                maxLines = 1; ellipsize = TextUtils.TruncateAt.END
+        if (n.text.isNotBlank()) {
+            col.addView(txt(n.text, 13f).apply {
+                alpha = .8f
+                setPadding(dp(18), dp(2), dp(18), dp(14))
+                maxLines = 2; ellipsize = TextUtils.TruncateAt.END
             })
-            addView(txt(n.text, 12f).apply {
-                alpha = .75f; maxLines = 1; ellipsize = TextUtils.TruncateAt.END
-            })
-        })
+        }
         onTap {
             try { n.intent?.send() } catch (e: Exception) { }
-            mode = Mode.IDLE
-            render()
+            close()
         }
-        return v
-    }
-
-    private fun chargeContent(): View {
-        val v = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            minimumWidth = dp(150)
-            setPadding(dp(18), dp(9), dp(18), dp(9))
-        }
-        v.addView(txt("⚡", 16f).apply { setTextColor(0xFF4ADE80.toInt()) })
-        v.addView(txt("$chargeLevel%", 15f, true).apply { setPadding(dp(8), 0, 0, 0) })
-        return v
+        return col
     }
 
     private fun openContent(): View {
         val v = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(8), dp(10), dp(8), dp(12))
+            setPadding(dp(10), 0, dp(10), dp(12))
         }
-        v.addView(View(this).apply {
-            background = rounded(0x55FFFFFF, dp(3))
-            layoutParams = LinearLayout.LayoutParams(dp(40), dp(4))
-        })
+        // zone du trou de la caméra : on laisse de la place
+        v.addView(View(this), LinearLayout.LayoutParams(-1, dp(cfg.idleH)))
         if (cfg.musicOn) ctrl?.let { v.addView(mediaCard(it)) }
-        if (cfg.torchOn && lampOn) v.addView(torchCard())
         if (cfg.chronoOn) {
             timers.values.forEach { v.addView(timerCard(it)) }
             if (running || acc > 0) v.addView(chronoCard())
         }
+        if (cfg.torchOn && lampOn) v.addView(torchCard())
         if (v.childCount == 1) {
             v.addView(txt("Rien en cours", 13f).apply {
-                alpha = .6f; setPadding(0, dp(14), 0, dp(6))
+                alpha = .6f
+                gravity = Gravity.CENTER
+                setPadding(0, dp(4), 0, dp(8))
             })
         }
-        onTap { mode = Mode.IDLE; render() }
+        onTap { close() }
         return v
     }
 
@@ -766,7 +932,7 @@ class IslandService : Service() {
         val card = card(0x22FFFFFF, 0x0DFFFFFF)
         card.gravity = Gravity.CENTER_VERTICAL
         card.addView(txt("⏱", 22f))
-        val tv = txt(timerText(t), 26f, true)
+        val tv = txt(timerText(t), 26f, true).apply { fontFeatureSettings = "tnum" }
         timerViews[t.key] = tv
         card.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -776,8 +942,7 @@ class IslandService : Service() {
         })
         card.setOnClickListener {
             try { t.intent?.send() } catch (e: Exception) { }
-            mode = Mode.IDLE
-            render()
+            close()
         }
         return card
     }
@@ -786,7 +951,7 @@ class IslandService : Service() {
         val card = card(0x22FFFFFF, 0x0DFFFFFF)
         card.gravity = Gravity.CENTER_VERTICAL
         card.addView(txt("⏱", 22f))
-        chronoTv = txt(fmt(chronoMs()), 26f, true)
+        chronoTv = txt(fmt(chronoMs()), 26f, true).apply { fontFeatureSettings = "tnum" }
         card.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(12) }
@@ -826,7 +991,12 @@ class IslandService : Service() {
 
     override fun onDestroy() {
         h.removeCallbacksAndMessages(null)
-        anim?.cancel()
+        enterAnim?.cancel()
+        colorAnim?.cancel()
+        if (::springW.isInitialized) {
+            springW.cancel()
+            springH.cancel()
+        }
         sp.unregisterOnSharedPreferenceChangeListener(prefListener)
         sp.edit().putBoolean("running", false).apply()
         Bus.notif = null
