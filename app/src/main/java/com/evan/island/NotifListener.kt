@@ -10,7 +10,8 @@ data class NotifData(
     val title: String,
     val text: String,
     val icon: Drawable?,
-    val intent: PendingIntent?
+    val intent: PendingIntent?,
+    val badge: String? = null
 )
 
 data class TimerInfo(
