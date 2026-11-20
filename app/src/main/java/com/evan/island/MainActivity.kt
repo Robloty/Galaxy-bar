@@ -40,6 +40,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -95,6 +96,9 @@ fun SettingsScreen(tick: Int) {
         NotificationManagerCompat.getEnabledListenerPackages(ctx).contains(ctx.packageName)
     }
 
+    // live : aperçu instantané dans l'île, sans écrire sur le disque
+    fun live(n: Cfg) { Bus.preview?.invoke(n) }
+    // upd : enregistre
     fun upd(n: Cfg) { cfg = n; n.save(sp) }
     fun toast(s: String) = Toast.makeText(ctx, s, Toast.LENGTH_SHORT).show()
     fun setRunning(on: Boolean) {
@@ -125,7 +129,7 @@ fun SettingsScreen(tick: Int) {
         Text("Island", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.Bold)
 
         Section("État") {
-            SwitchRow("Île active", running, { setRunning(it) })
+            SwitchRow("Île active", running) { setRunning(it) }
             PermRow(overlayOk, "Affichage par-dessus", "Autoriser") {
                 ctx.startActivity(
                     Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -144,17 +148,28 @@ fun SettingsScreen(tick: Int) {
         }
 
         Section("Position et taille") {
-            SliderRow("Position verticale", cfg.posY, 0, 120, " dp") { upd(cfg.copy(posY = it)) }
-            SliderRow("Position horizontale", cfg.posX, -160, 160, " dp") { upd(cfg.copy(posX = it)) }
-            SliderRow("Largeur au repos", cfg.idleW, 60, 260, " dp") { upd(cfg.copy(idleW = it)) }
-            SliderRow("Hauteur au repos", cfg.idleH, 20, 60, " dp") { upd(cfg.copy(idleH = it)) }
-            SliderRow("Largeur ouverte", cfg.openW, 260, 400, " dp") { upd(cfg.copy(openW = it)) }
-            SliderRow("Arrondi des cartes", cfg.radius, 12, 44, " dp") { upd(cfg.copy(radius = it)) }
+            SliderRow("Position verticale", cfg.posY, -30, 200, " dp",
+                { live(cfg.copy(posY = it)) }) { upd(cfg.copy(posY = it)) }
+            SliderRow("Position horizontale", cfg.posX, -200, 200, " dp",
+                { live(cfg.copy(posX = it)) }) { upd(cfg.copy(posX = it)) }
+            SliderRow("Largeur au repos", cfg.idleW, 60, 260, " dp",
+                { live(cfg.copy(idleW = it)) }) { upd(cfg.copy(idleW = it)) }
+            SliderRow("Hauteur au repos", cfg.idleH, 20, 60, " dp",
+                { live(cfg.copy(idleH = it)) }) { upd(cfg.copy(idleH = it)) }
+            SliderRow("Largeur ouverte", cfg.openW, 260, 400, " dp",
+                { live(cfg.copy(openW = it)) }) { upd(cfg.copy(openW = it)) }
+            SliderRow("Arrondi des cartes", cfg.radius, 12, 44, " dp",
+                { live(cfg.copy(radius = it)) }) { upd(cfg.copy(radius = it)) }
+            Text(
+                "Pour coller la pilule à la caméra, descends la position verticale vers 0 ou en négatif.",
+                color = Color(0x99FFFFFF), fontSize = 12.sp
+            )
         }
 
-        Section("Verre") {
-            SwitchRow("Mode verre", cfg.glass, { upd(cfg.copy(glass = it)) })
-            SliderRow("Opacité", cfg.opacity, 20, 100, " %") { upd(cfg.copy(opacity = it)) }
+        Section("Verre (cartes ouvertes et notifications)") {
+            SwitchRow("Mode verre", cfg.glass) { upd(cfg.copy(glass = it)) }
+            SliderRow("Opacité", cfg.opacity, 40, 100, " %",
+                { live(cfg.copy(opacity = it)) }) { upd(cfg.copy(opacity = it)) }
             Text("Teinte", color = Color.White)
             Spacer(Modifier.height(6.dp))
             Row(
@@ -178,11 +193,10 @@ fun SettingsScreen(tick: Int) {
                 }
             }
             Spacer(Modifier.height(6.dp))
-            SwitchRow("Bordure lumineuse", cfg.border, { upd(cfg.copy(border = it)) })
+            SwitchRow("Bordure lumineuse", cfg.border) { upd(cfg.copy(border = it)) }
             if (Build.VERSION.SDK_INT >= 31) {
-                SliderRow("Flou réel du fond (expérimental)", cfg.blur, 0, 100, "") {
-                    upd(cfg.copy(blur = it))
-                }
+                SliderRow("Flou réel du fond (expérimental)", cfg.blur, 0, 100, "",
+                    { live(cfg.copy(blur = it)) }) { upd(cfg.copy(blur = it)) }
                 Text(
                     "Le flou réel floute tout le rectangle de la fenêtre : les coins peuvent paraître carrés. 0 = désactivé.",
                     color = Color(0x99FFFFFF), fontSize = 12.sp
@@ -191,40 +205,47 @@ fun SettingsScreen(tick: Int) {
         }
 
         Section("Animations") {
-            SliderRow("Vitesse", cfg.speed, 50, 200, " %") { upd(cfg.copy(speed = it)) }
-            SliderRow("Rebond", cfg.bounce, 0, 100, "") { upd(cfg.copy(bounce = it)) }
-            SwitchRow("Flou vers net à l'ouverture", cfg.focusBlur, { upd(cfg.copy(focusBlur = it)) })
+            SliderRow("Vitesse", cfg.speed, 50, 200, " %",
+                { }) { upd(cfg.copy(speed = it)) }
+            SliderRow("Rebond", cfg.bounce, 0, 100, "",
+                { }) { upd(cfg.copy(bounce = it)) }
+            SwitchRow("Flou vers net à l'ouverture", cfg.focusBlur) { upd(cfg.copy(focusBlur = it)) }
         }
 
         Section("Comportement") {
-            SwitchRow("Notifications", cfg.notifOn, { upd(cfg.copy(notifOn = it)) })
-            SliderRow("Durée des notifications", cfg.notifSec, 2, 10, " s") { upd(cfg.copy(notifSec = it)) }
-            SwitchRow("Charge (⚡)", cfg.chargeOn, { upd(cfg.copy(chargeOn = it)) })
-            SwitchRow("Musique", cfg.musicOn, { upd(cfg.copy(musicOn = it)) })
-            SwitchRow("Lampe torche", cfg.torchOn, { upd(cfg.copy(torchOn = it)) })
-            SwitchRow("Chronomètre", cfg.chronoOn, { upd(cfg.copy(chronoOn = it)) })
-            SwitchRow("Démarrer avec le téléphone", cfg.boot, { upd(cfg.copy(boot = it)) })
+            SwitchRow("Notifications", cfg.notifOn) { upd(cfg.copy(notifOn = it)) }
+            SliderRow("Durée des notifications", cfg.notifSec, 2, 10, " s",
+                { }) { upd(cfg.copy(notifSec = it)) }
+            SwitchRow("Charge (⚡)", cfg.chargeOn) { upd(cfg.copy(chargeOn = it)) }
+            SwitchRow("Musique", cfg.musicOn) { upd(cfg.copy(musicOn = it)) }
+            SwitchRow("Lampe torche", cfg.torchOn) { upd(cfg.copy(torchOn = it)) }
+            SwitchRow("Minuteurs et chrono", cfg.chronoOn) { upd(cfg.copy(chronoOn = it)) }
+            SwitchRow("Démarrer avec le téléphone", cfg.boot) { upd(cfg.copy(boot = it)) }
         }
 
         Section("Tester") {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                val bc = ButtonDefaults.buttonColors(containerColor = Color(0x33FFFFFF), contentColor = Color.White)
-                Button(onClick = { test("open") }, colors = bc, modifier = Modifier.weight(1f)) {
-                    Text("Ouvrir", fontSize = 13.sp)
-                }
-                Button(onClick = { test("notif") }, colors = bc, modifier = Modifier.weight(1f)) {
-                    Text("Notif", fontSize = 13.sp)
-                }
-                Button(onClick = { test("charge") }, colors = bc, modifier = Modifier.weight(1f)) {
-                    Text("Charge", fontSize = 13.sp)
-                }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                val bc = ButtonDefaults.buttonColors(
+                    containerColor = Color(0x33FFFFFF), contentColor = Color.White
+                )
+                val pad = androidx.compose.foundation.layout.PaddingValues(horizontal = 4.dp)
+                Button(onClick = { test("open") }, colors = bc, contentPadding = pad,
+                    modifier = Modifier.weight(1f)) { Text("Ouvrir", fontSize = 12.sp) }
+                Button(onClick = { test("notif") }, colors = bc, contentPadding = pad,
+                    modifier = Modifier.weight(1f)) { Text("Notif", fontSize = 12.sp) }
+                Button(onClick = { test("charge") }, colors = bc, contentPadding = pad,
+                    modifier = Modifier.weight(1f)) { Text("Charge", fontSize = 12.sp) }
+                Button(onClick = { test("chrono") }, colors = bc, contentPadding = pad,
+                    modifier = Modifier.weight(1f)) { Text("Chrono", fontSize = 12.sp) }
             }
         }
 
         Button(
             onClick = { upd(Cfg()) },
             modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0x22FFFFFF), contentColor = Color.White)
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Color(0x22FFFFFF), contentColor = Color.White
+            )
         ) { Text("Réinitialiser les réglages") }
 
         Spacer(Modifier.height(24.dp))
@@ -259,15 +280,20 @@ fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
 }
 
 @Composable
-fun SliderRow(label: String, value: Int, min: Int, max: Int, unit: String, onChange: (Int) -> Unit) {
+fun SliderRow(
+    label: String, value: Int, min: Int, max: Int, unit: String,
+    onLive: (Int) -> Unit, onDone: (Int) -> Unit
+) {
+    var v by remember(value) { mutableFloatStateOf(value.toFloat()) }
     Column(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(label, color = Color.White)
-            Text("$value$unit", color = Color(0xFFB9B3FF))
+            Text("${v.roundToInt()}$unit", color = Color(0xFFB9B3FF))
         }
         Slider(
-            value = value.toFloat(),
-            onValueChange = { onChange(it.roundToInt()) },
+            value = v,
+            onValueChange = { v = it; onLive(it.roundToInt()) },
+            onValueChangeFinished = { onDone(v.roundToInt()) },
             valueRange = min.toFloat()..max.toFloat()
         )
     }
