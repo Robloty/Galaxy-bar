@@ -24,13 +24,13 @@ data class Cfg(
     val posX: Int = 0,
     val idleW: Int = 130,
     val idleH: Int = 34,
+    val holeW: Int = 38,
     val openW: Int = 344,
     val radius: Int = 34,
-    val glass: Boolean = true,
-    val opacity: Int = 75,
+    val style: Int = 1,
+    val opacity: Int = 92,
     val tint: Int = 0,
     val border: Boolean = true,
-    val blur: Int = 0,
     val speed: Int = 100,
     val bounce: Int = 45,
     val focusBlur: Boolean = true,
@@ -46,10 +46,10 @@ data class Cfg(
         sp.edit()
             .putInt("posY", posY).putInt("posX", posX)
             .putInt("idleW", idleW).putInt("idleH", idleH)
-            .putInt("openW", openW).putInt("radius", radius)
-            .putBoolean("glass", glass).putInt("opacity", opacity)
-            .putInt("tint", tint).putBoolean("border", border)
-            .putInt("blur", blur).putInt("speed", speed)
+            .putInt("holeW", holeW).putInt("openW", openW)
+            .putInt("radius", radius).putInt("style", style)
+            .putInt("opacity", opacity).putInt("tint", tint)
+            .putBoolean("border", border).putInt("speed", speed)
             .putInt("bounce", bounce).putBoolean("focusBlur", focusBlur)
             .putBoolean("notifOn", notifOn).putInt("notifSec", notifSec)
             .putBoolean("chargeOn", chargeOn).putBoolean("musicOn", musicOn)
@@ -66,13 +66,13 @@ data class Cfg(
                 posX = sp.getInt("posX", d.posX),
                 idleW = sp.getInt("idleW", d.idleW),
                 idleH = sp.getInt("idleH", d.idleH),
+                holeW = sp.getInt("holeW", d.holeW),
                 openW = sp.getInt("openW", d.openW),
                 radius = sp.getInt("radius", d.radius),
-                glass = sp.getBoolean("glass", d.glass),
+                style = sp.getInt("style", d.style),
                 opacity = sp.getInt("opacity", d.opacity),
                 tint = sp.getInt("tint", d.tint),
                 border = sp.getBoolean("border", d.border),
-                blur = sp.getInt("blur", d.blur),
                 speed = sp.getInt("speed", d.speed),
                 bounce = sp.getInt("bounce", d.bounce),
                 focusBlur = sp.getBoolean("focusBlur", d.focusBlur),
