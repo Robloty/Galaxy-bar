@@ -3,6 +3,7 @@ package com.evan.island
 import android.graphics.Canvas
 import android.graphics.ColorFilter
 import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.RectF
@@ -11,8 +12,8 @@ import android.graphics.drawable.Drawable
 import kotlin.math.min
 
 class GlassDrawable(
-    private val top: Int,
-    private val bottom: Int,
+    top: Int,
+    bottom: Int,
     private val glass: Boolean,
     private val border: Boolean,
     private val density: Float
@@ -23,21 +24,31 @@ class GlassDrawable(
 
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private val r = RectF()
+    private val m = Matrix()
+    private val base = LinearGradient(0f, 0f, 0f, 1f, top, bottom, Shader.TileMode.CLAMP)
+    private val sheen = LinearGradient(
+        0f, 0f, 0f, 1f, 0x3CFFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP
+    )
 
     override fun draw(c: Canvas) {
         r.set(bounds)
-        if (r.width() <= 0f || r.height() <= 0f) return
-        val rad = min(radius, min(r.width(), r.height()) / 2f)
+        val w = r.width()
+        val hh = r.height()
+        if (w <= 0f || hh <= 0f) return
+        val rad = min(radius, min(w, hh) / 2f)
 
         p.style = Paint.Style.FILL
-        p.shader = LinearGradient(0f, r.top, 0f, r.bottom, top, bottom, Shader.TileMode.CLAMP)
+        m.setScale(1f, hh)
+        m.postTranslate(0f, r.top)
+        base.setLocalMatrix(m)
+        p.shader = base
         c.drawRoundRect(r, rad, rad, p)
 
         if (glass) {
-            p.shader = LinearGradient(
-                0f, r.top, 0f, r.top + r.height() * 0.6f,
-                0x3CFFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP
-            )
+            m.setScale(1f, hh * 0.6f)
+            m.postTranslate(0f, r.top)
+            sheen.setLocalMatrix(m)
+            p.shader = sheen
             c.drawRoundRect(r, rad, rad, p)
         }
         if (border) {
